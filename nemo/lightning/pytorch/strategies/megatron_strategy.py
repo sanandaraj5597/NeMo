@@ -48,6 +48,7 @@ from lightning.fabric.utilities.seed import reset_seed
 from lightning.pytorch.accelerators import CPUAccelerator
 from lightning.pytorch.loops import _AutomaticOptimization, evaluation_loop, fit_loop, prediction_loop
 from lightning.pytorch.loops.fetchers import _DataLoaderIterDataFetcher
+from lightning.pytorch.plugins.io.wrapper import _WrappingCheckpointIO
 from lightning.pytorch.strategies.ddp import DDPStrategy
 from lightning.pytorch.trainer.states import RunningStage, TrainerFn
 from lightning.pytorch.utilities.types import STEP_OUTPUT
@@ -129,6 +130,8 @@ class ParallelismConfig:
     num_distributed_optimizer_instances: int = 1
     nccl_communicator_config_path: str = None
     use_sharp: bool = False
+    pipeline_model_parallel_layout: Optional[Union[str, List[List[str]]]] = None
+    use_gloo_process_groups: bool = True
 
 
 class MegatronStrategy(DDPStrategy, io.IOMixin):
@@ -168,6 +171,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ckpt_type (TrainerCkptProtocol): Checkpoint type. Defaults to TrainerCheckpoint.
         ckpt_load_optimizer (bool): Load optimizer state from trainer.ckpt_path. Defaults to True.
         ckpt_save_optimizer (bool): Save optimizer states in checkpoint. Defaults to True.
+        ckpt_load_main_params (bool): Load main parameters from trainer.ckpt_path. Defaults to False.
         ddp (Union[DDPLiteral, DistributedDataParallelConfig]): DDP configuration. Defaults to "megatron".
         fsdp (Optional[FSDPLiteral]): Option of using torch FSDP2, select from ["megatron", "pytorch"].
             Defaults to None.
@@ -218,6 +222,9 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         nccl_communicator_config_path (Optional[str]): Path to the yaml file of NCCL communicator configurations.
             `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set for each communicator.
         use_sharp (bool): Whether to use SHARP. Defaults to False.
+        pipeline_model_parallel_layout (Optional[Union[str, List[List[str]]]]): The layout of all layers among
+            different PP and VP stages.
+        use_gloo_process_groups (bool): Whether to use Gloo process groups. Defaults to True.
         **kwargs: Additional keyword arguments.
 
     Note:
@@ -252,6 +259,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         find_unused_parameters: bool = False,
         ckpt_load_optimizer: bool = True,
         ckpt_save_optimizer: bool = True,
+        ckpt_load_main_params: bool = False,
         ddp: Union[DDPLiteral, DistributedDataParallelConfig] = "megatron",
         fsdp: Optional[FSDPLiteral] = None,
         lazy_init: bool = False,
@@ -277,6 +285,8 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         use_tp_pp_dp_mapping: bool = False,
         num_distributed_optimizer_instances: int = 1,
         nccl_communicator_config_path: Optional[str] = None,
+        pipeline_model_parallel_layout: Optional[Union[str, List[List[str]]]] = None,
+        use_gloo_process_groups: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -312,6 +322,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.lazy_init = lazy_init
         self.ckpt_load_optimizer = ckpt_load_optimizer
         self.ckpt_save_optimizer = ckpt_save_optimizer
+        self.ckpt_load_main_params = ckpt_load_main_params
         self.ckpt_load_strictness = ckpt_load_strictness
         self.use_te_rng_tracker = use_te_rng_tracker
         self.use_sharp = use_sharp
@@ -334,8 +345,10 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.replace_progress_bar = replace_progress_bar
         self.progress_interval = progress_interval
         self.nccl_communicator_config_path = nccl_communicator_config_path
+        self.use_gloo_process_groups = use_gloo_process_groups
         self.restore_config = restore_config
         self.timers = Timers(megatron_log_level, "minmax")  ## could also set this for optimizer if we want
+        self.pipeline_model_parallel_layout = pipeline_model_parallel_layout
 
         self._ddp = ddp
         if ddp == "megatron":
@@ -381,6 +394,9 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             self.no_ddp_communication_hook = False
         else:
             raise ValueError(f"Invalid DDP type: {ddp}")
+
+        if self.ckpt_load_optimizer and self.ckpt_load_main_params:
+            raise ValueError("ckpt_load_optimizer and ckpt_load_main_params cannot be both set to True.")
 
         if isinstance(self.ddp_config, DistributedDataParallelConfig):
             self.ddp_config.num_distributed_optimizer_instances = self.num_distributed_optimizer_instances
@@ -700,6 +716,18 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         _optimizers_to_device(self.optimizers, self.root_device)
 
     @override
+    def on_validation_end(self) -> None:
+        "Runs after validation loop"
+        for model_chunk in self.model:
+            model_chunk.train()
+
+    @override
+    def on_test_end(self) -> None:
+        "Runs after test loop"
+        for model_chunk in self.model:
+            model_chunk.train()
+
+    @override
     def training_step(self, dataloader_iter, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
         """Runs one training step"""
         assert self.lightning_module is not None
@@ -864,10 +892,18 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
 
         return kwargs
 
-    def optimizer_sharded_state_dict(self, is_loading=False):
+    def optimizer_sharded_state_dict(self, is_loading: bool = False, metadata: Optional[dict] = None):
         """
         Sharded state dictionary for an MainParamsOptimizerWrapper.
         Used to save and load the optimizer state when training with distributed_checkpoint.
+
+        Args:
+            is_loading (bool, optional): set to True if the sharded state dict is intended
+                for checkpoint loading (as opposed to saving). Defaults to False.
+            metadata (dict, optional): sharded state dict metadata passed from the framework.
+                Used to control the details of sharded state dict creation, in particular
+                the state dict format of the DistributedOptimizer with the flag
+                `distrib_optim_sharding_type`. Defaults to None (empty metadata).
 
         Returns
         -------
@@ -878,10 +914,20 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         # TODO: Fix when MainParamsOptimizerWrapper is not used
 
         optimizer = self.lightning_module.optimizers(use_pl_optimizer=False)
-        sharding_type = "fully_sharded_model_space" if self.parallel_save_optim else "dp_zero_gather_scatter"
+        if metadata is None:
+            metadata = self.sharded_state_dict_metadata
+            logging.debug(
+                f'No sharded_state_dict metadata passed for the optimizer,'
+                f' using metadata for checkpoint save: {metadata}'
+            )
+        else:
+            logging.debug(f'Using passed sharded_state_dict metadata in the optimizer: {metadata}')
 
         return _strategy_lib.optimizer_sharded_state_dict(
-            self.megatron_parallel, optimizer, is_loading=is_loading, sharding_type=sharding_type
+            self.megatron_parallel,
+            optimizer,
+            is_loading=is_loading,
+            metadata=metadata,
         )
 
     @override
@@ -914,6 +960,9 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             if self.ckpt_save_optimizer:
                 checkpoint["optimizer"] = [self.optimizer_sharded_state_dict()]
 
+        if not storage_options:
+            storage_options = {}
+        storage_options['content_metadata'] = self.sharded_state_dict_metadata
         self.checkpoint_io.save_checkpoint(checkpoint, filepath, storage_options=storage_options)
 
         # Save ModelOpt state too, if it exists.
@@ -945,13 +994,16 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             sharded_state_context = nullcontext
 
         # After dist_checkpointing.load, sharded tensors will be replaced with tensors
+        sharded_sd_metadata = self.unwrapped_checkpoint_io.load_content_metadata(checkpoint_path)
         sharded_state_dict = {}
         with sharded_state_context():
-            sharded_state_dict["state_dict"] = self.megatron_parallel.sharded_state_dict()
+            sharded_state_dict["state_dict"] = self.megatron_parallel.sharded_state_dict(metadata=sharded_sd_metadata)
 
         if restore_optimizers and self.trainer.state.fn == TrainerFn.FITTING:
             if self.lightning_module.optimizers(use_pl_optimizer=False):
-                sharded_state_dict["optimizer"] = [self.optimizer_sharded_state_dict(is_loading=True)]
+                sharded_state_dict["optimizer"] = [
+                    self.optimizer_sharded_state_dict(is_loading=True, metadata=sharded_sd_metadata)
+                ]
 
         strict = (
             self.lightning_module.strict_loading if self.ckpt_load_strictness is None else self.ckpt_load_strictness
@@ -973,6 +1025,17 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             return final_checkpoint
 
         return checkpoint
+
+    @property
+    def sharded_state_dict_metadata(self):
+        """Metadata used for sharded_state_dict generation during checkpoint save."""
+        metadata = {}
+        if isinstance(self.ddp_config, DistributedDataParallelConfig) and self.ddp_config.use_distributed_optimizer:
+            if self.parallel_save_optim:
+                metadata["distrib_optim_sharding_type"] = "fully_sharded_model_space"
+            else:
+                metadata["distrib_optim_sharding_type"] = "dp_zero_gather_scatter"
+        return metadata
 
     def selective_restore(self) -> None:
         """Implements selective restoration of checkpoint"""
@@ -1043,7 +1106,13 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
 
         if not 'optimizer' in checkpoint:
             for opt in self.optimizers:
-                opt.reload_model_params()
+                if self.ckpt_load_main_params:
+                    if "state_dict" in checkpoint:
+                        opt.reload_model_params(checkpoint["state_dict"])
+                    else:
+                        opt.reload_model_params(checkpoint)
+                else:
+                    opt.reload_model_params()
 
     @property
     @override
@@ -1067,6 +1136,14 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
     def checkpoint_io(self, io: CheckpointIO) -> None:
         """CheckpointIO setter"""
         self._checkpoint_io = io
+
+    @property
+    def unwrapped_checkpoint_io(self) -> CheckpointIO:
+        """Unwraps `checkpoint_io` from all wrappers."""
+        checkpoint_io = self.checkpoint_io
+        while isinstance(checkpoint_io, _WrappingCheckpointIO):
+            checkpoint_io = checkpoint_io.checkpoint_io
+        return checkpoint_io
 
     @property
     def current_epoch_step(self) -> int:
@@ -1130,6 +1207,8 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             num_distributed_optimizer_instances=self.num_distributed_optimizer_instances,
             nccl_communicator_config_path=self.nccl_communicator_config_path,
             use_sharp=self.use_sharp,
+            pipeline_model_parallel_layout=self.pipeline_model_parallel_layout,
+            use_gloo_process_groups=self.use_gloo_process_groups,
         )
 
     @contextmanager
